@@ -1,0 +1,296 @@
+import os
+import random
+import pickle
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from scipy import stats
+
+from models_mrpnn import PNN, GraphMixer_initial, MLP, SparseMoEModel
+from my_utils2 import CustomDataset, evaluate_model_with_metrics
+
+SEEDS = [42, 123, 456, 789, 2026]
+ABLATION_MODELS = ["Ours"]
+
+TASK_FILES = [
+    "CN-AD.csv",
+    "MCI-AD.csv",
+    "CN-MCI.csv",
+]
+TASK_NAMES = ["CN-AD (Task 0)", "MCI-AD (Task 1)", "CN-MCI (Task 2)"]
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+class Baseline_Model(nn.Module):
+    def __init__(self, hidden_dim=64, num_classes=2):
+        super().__init__()
+        # 使用 LazyLinear 动态推断展平输入维度，无需硬编码 348
+        self.net = nn.Sequential(
+            nn.LazyLinear(hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.Linear(16, num_classes)
+        )
+
+    def forward(self, modalities, task_id=None):
+        if modalities['x_path'].shape[-1] == 6:
+            x_brain = modalities['x_path'].flatten(start_dim=1).float()
+        elif 'x_brain' in modalities and modalities['x_brain'].shape[-1] == 6:
+            x_brain = modalities['x_brain'].flatten(start_dim=1).float()
+        else:
+            x_brain = modalities['x_path'].flatten(start_dim=1).float()
+
+        x_omic = modalities['x_omic'].flatten(start_dim=1).float()
+        x = torch.cat([x_brain, x_omic], dim=-1)
+        return self.net(x)
+
+
+class Method1_Model(nn.Module):
+    def __init__(self, hidden_dim=16, num_classes=2):
+        super().__init__()
+        self.fusion_module = GraphMixer_initial(num_features=6, hidden_dim=hidden_dim)
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(8),
+            nn.Linear(8, num_classes)
+        )
+
+    def forward(self, modalities, task_id=None):
+        feat = self.fusion_module(modalities['x_path'], modalities['x_omic'], modalities['ref'])
+        return self.classifier(feat)
+
+
+class Method2_Model(nn.Module):
+    def __init__(self, mlp_input_dim=8, mlp_hidden_dim=16, mlp_output_dim=4,
+                 moe_input_dim=8, moe_hidden_dim=16, moe_output_dim=4,
+                 classifier_input_dim=4, num_experts=4):
+        super().__init__()
+        self.fusion_module = GraphMixer_initial(num_features=6, hidden_dim=16)
+        self.mlp = MLP(input_dim=mlp_input_dim, hidden_dim=mlp_hidden_dim, output_dim=mlp_output_dim)
+        self.moe = SparseMoEModel(input_dim=moe_input_dim, hidden_dim=moe_hidden_dim, output_dim=moe_output_dim,
+                                  num_experts=num_experts)
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(classifier_input_dim),
+            nn.Linear(classifier_input_dim, 2)
+        )
+
+    def forward(self, modalities, task_id=None):
+        x = self.fusion_module(modalities['x_path'], modalities['x_omic'], modalities['ref'])
+        h1 = F.relu(self.mlp(x))
+        h2 = self.moe(x, task_id=task_id if (task_id is not None and task_id < self.moe.num_routers) else None)
+        mlp_moe = 0.5 * h1 + 0.5 * h2
+        return self.classifier(mlp_moe)
+
+
+def build_ablation_model(model_name):
+    if model_name in ["Ours", "Method_3"]:
+        return PNN(n_layers=3)
+    elif model_name == "Baseline":
+        return Baseline_Model()
+    elif model_name == "Method_1":
+        return Method1_Model()
+    elif model_name == "Method_2":
+        return Method2_Model()
+    else:
+        raise ValueError(f"Unknown ablation configuration: {model_name}")
+
+
+# ==============================================================
+# 2. 5 个 Seed 独立循环执行主体
+# ==============================================================
+
+all_ablation_results = {
+    m: {t: {"acc": [], "sen": [], "spe": [], "auc": [], "pre": [], "f1": []} for t in range(len(TASK_FILES))}
+    for m in ABLATION_MODELS
+}
+
+for model_name in ABLATION_MODELS:
+    print("\n" + "=" * 70)
+    print(f"🚀 开始测试模型配置: {model_name}")
+    print("=" * 70)
+
+    for seed_idx, seed in enumerate(SEEDS):
+        print(f"\n---> [Model: {model_name}] 正在执行 Seed [{seed_idx + 1}/5] (Random Seed = {seed})")
+        set_seed(seed)
+
+        train_loaders = []
+        test_loaders = []
+
+        for task_id, task_file in enumerate(TASK_FILES):
+            data = pd.read_csv(task_file)
+            data.replace('<missing>', pd.NA, inplace=True)
+            data.dropna(inplace=True)
+
+            # 严格先进行划分，防止测试集数据泄露
+            train_data, test_data = train_test_split(
+                data, test_size=0.2, random_state=seed, stratify=data.iloc[:, -1]
+            )
+
+            train_data = train_data.copy()
+            test_data = test_data.copy()
+
+            # 仅在训练集上 fit，在测试集上仅执行 transform
+            scaler = StandardScaler()
+            columns_to_scale = data.columns[3:-2]
+            train_data[columns_to_scale] = scaler.fit_transform(train_data[columns_to_scale])
+            test_data[columns_to_scale] = scaler.transform(test_data[columns_to_scale])
+
+            train_loader = DataLoader(CustomDataset(train_data), batch_size=64, shuffle=True, drop_last=True)
+            test_loader = DataLoader(CustomDataset(test_data), batch_size=64, shuffle=False)
+
+            train_loaders.append(train_loader)
+            test_loaders.append(test_loader)
+
+        if model_name in ["Ours", "Method_3"]:
+            pnn_model = build_ablation_model(model_name)
+
+        for task_id in range(len(TASK_FILES)):
+            train_loader = train_loaders[task_id]
+
+            if model_name in ["Ours", "Method_3"]:
+                model = pnn_model
+                model.new_task(
+                    mlp_input_dim=8, mlp_hidden_dim=16, mlp_output_dim=4,
+                    moe_input_dim=8, moe_hidden_dim=16, moe_output_dim=4,
+                    classifier_input_dim=4,
+                    num_experts=4
+                )
+            else:
+                model = build_ablation_model(model_name)
+
+            # 若使用 Baseline_Model 的 LazyLinear，用一个 batch 触发形状推断以初始化参数
+            if model_name == "Baseline":
+                for init_feats, init_genomic, _, init_brain, init_ref in train_loader:
+                    dummy_modalities = {
+                        'x_path': init_feats,
+                        'x_omic': init_genomic,
+                        'x_brain': init_brain,
+                        'ref': init_ref
+                    }
+                    _ = model(dummy_modalities, task_id=task_id)
+                    break
+
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=0.001,
+                weight_decay=1e-4
+            )
+
+            for epoch in range(200):
+                model.train()
+                for features, genomic, labels, brain, ref in train_loader:
+                    optimizer.zero_grad()
+
+                    if model_name == "Method_3":
+                        ref = torch.full_like(ref, fill_value=1.0 / ref.shape[1])
+
+                    modalities = {
+                        'x_path': features,
+                        'x_omic': genomic,
+                        'x_brain': brain,
+                        'ref': ref,
+                        'x_label': labels
+                    }
+
+                    logits = model(modalities, task_id=task_id)
+
+                    if labels.dim() > 1 and labels.shape[-1] > 1:
+                        targets = labels.argmax(dim=-1).long()
+                    else:
+                        targets = labels.squeeze().long()
+
+                    loss = criterion(logits, targets)
+                    loss.backward()
+
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+            model.eval()
+            acc, sen, spe, auc_score, pre, f1 = evaluate_model_with_metrics(
+                model, test_loaders[task_id], task_id
+            )
+            all_ablation_results[model_name][task_id]["acc"].append(acc * 100.0)
+            all_ablation_results[model_name][task_id]["auc"].append(auc_score)
+            all_ablation_results[model_name][task_id]["sen"].append(sen * 100.0)
+            all_ablation_results[model_name][task_id]["spe"].append(spe * 100.0)
+            all_ablation_results[model_name][task_id]["f1"].append(f1 * 100.0)
+
+    # -------------------------------------------------------------
+    # 单个模型跑完后的阶段性结果输出
+    # -------------------------------------------------------------
+    print("\n" + "#" * 90)
+    print(f"📌 [阶段总结] 配置 {model_name} 已完成 5-Seed 评测，实时统计结果如下：")
+    print("#" * 90)
+    for t_idx, t_name in enumerate(TASK_NAMES):
+        accs = all_ablation_results[model_name][t_idx]["acc"]
+        aucs = all_ablation_results[model_name][t_idx]["auc"]
+        sens = all_ablation_results[model_name][t_idx]["sen"]
+        spes = all_ablation_results[model_name][t_idx]["spe"]
+
+        acc_mean, acc_std = np.mean(accs), np.std(accs, ddof=1)
+        auc_mean, auc_std = np.mean(aucs), np.std(aucs, ddof=1)
+        sen_mean, sen_std = np.mean(sens), np.std(sens, ddof=1)
+        spe_mean, spe_std = np.mean(spes), np.std(spes, ddof=1)
+
+        print(
+            f"  • {t_name:<16}: ACC = {acc_mean:.2f}±{acc_std:.2f}% | AUC = {auc_mean:.4f}±{auc_std:.4f} | SEN = {sen_mean:.2f}±{sen_std:.2f}% | SPE = {spe_mean:.2f}±{spe_std:.2f}%"
+        )
+    print("#" * 90 + "\n")
+
+# ==============================================================
+# 3. 统计总表输出 (Mean ± SD [95% CI])
+# ==============================================================
+print("\n" + "=" * 135)
+print("📊 消融实验 5 次独立种子完整统计总表 (Mean ± SD [95% CI])")
+print("=" * 135)
+
+for t_idx, t_name in enumerate(TASK_NAMES):
+    print(f"\n▶ 任务: {t_name}")
+    print(f"{'Model':<12} | {'ACC (%)':<26} | {'AUC':<24} | {'SEN (%)':<26} | {'SPE (%)':<26}")
+    print("-" * 135)
+
+    for m_name in ABLATION_MODELS:
+        accs = all_ablation_results[m_name][t_idx]["acc"]
+        acc_mean, acc_std = np.mean(accs), np.std(accs, ddof=1)
+        acc_ci = stats.t.interval(0.95, df=len(accs) - 1, loc=acc_mean, scale=stats.sem(accs))
+        acc_str = f"{acc_mean:.2f} ± {acc_std:.2f} [{acc_ci[0]:.1f}, {acc_ci[1]:.1f}]"
+
+        aucs = all_ablation_results[m_name][t_idx]["auc"]
+        auc_mean, auc_std = np.mean(aucs), np.std(aucs, ddof=1)
+        auc_ci = stats.t.interval(0.95, df=len(aucs) - 1, loc=auc_mean, scale=stats.sem(aucs))
+        auc_str = f"{auc_mean:.4f} ± {auc_std:.4f} [{auc_ci[0]:.3f}, {auc_ci[1]:.3f}]"
+
+        sens = all_ablation_results[m_name][t_idx]["sen"]
+        sen_mean, sen_std = np.mean(sens), np.std(sens, ddof=1)
+        sen_ci = stats.t.interval(0.95, df=len(sens) - 1, loc=sen_mean, scale=stats.sem(sens))
+        sen_str = f"{sen_mean:.2f} ± {sen_std:.2f} [{sen_ci[0]:.1f}, {sen_ci[1]:.1f}]"
+
+        spes = all_ablation_results[m_name][t_idx]["spe"]
+        spe_mean, spe_std = np.mean(spes), np.std(spes, ddof=1)
+        spe_ci = stats.t.interval(0.95, df=len(spes) - 1, loc=spe_mean, scale=stats.sem(spes))
+        spe_str = f"{spe_mean:.2f} ± {spe_std:.2f} [{spe_ci[0]:.1f}, {spe_ci[1]:.1f}]"
+
+        print(f"{m_name:<12} | {acc_str:<26} | {auc_str:<24} | {sen_str:<26} | {spe_str:<26}")
+
+with open("ablation_5seeds_metrics_fixed.pkl", "wb") as f:
+    pickle.dump(all_ablation_results, f)
+print("\n✅ 所有数据已成功保存至 ablation_5seeds_metrics_fixed.pkl！")
