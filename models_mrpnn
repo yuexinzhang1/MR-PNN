@@ -1,0 +1,320 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from my_utils2 import MultiHeadAttentionQ
+
+
+class Adapter(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.down_proj = nn.Linear(input_dim, output_dim // 2)
+        self.up_proj = nn.Linear(output_dim // 2, output_dim)
+        self.norm = nn.LayerNorm(input_dim)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = F.relu(self.down_proj(x))
+        x = self.up_proj(x)
+        return x + residual
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(MLP, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class Expert(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(Expert, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class Router(nn.Module):
+    def __init__(self, input_dim, num_experts, k=2):
+        super(Router, self).__init__()
+        self.k = k
+        self.router = nn.Linear(input_dim, num_experts)
+        nn.init.normal_(self.router.weight, std=0.01)
+        nn.init.constant_(self.router.bias, 0)
+
+    def forward(self, x):
+        logits = self.router(x)
+        topk_values, topk_indices = torch.topk(logits, self.k, dim=-1)
+        routing_weights = F.softmax(topk_values, dim=-1)
+        return topk_indices, routing_weights
+
+
+class SparseMoEModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_experts=3, num_routers=3, k=2):
+        super(SparseMoEModel, self).__init__()
+        self.num_experts = num_experts
+        self.num_routers = num_routers
+        self.k = k
+
+        self.experts = nn.ModuleList([
+            MLP(input_dim, hidden_dim, output_dim) for _ in range(num_experts)
+        ])
+        self.routers = nn.ModuleList([
+            Router(input_dim, num_experts, k=k) for _ in range(num_routers)
+        ])
+
+    def forward(self, x, task_id=None):
+        batch_size, device = x.shape[0], x.device
+
+        all_expert_outputs = [expert(x) for expert in self.experts]
+        expert_outputs = torch.stack(all_expert_outputs, dim=0)
+
+        def route(router):
+            topk_indices, routing_weights = router(x)
+            batch_idx = torch.arange(batch_size, device=device).unsqueeze(-1)
+            selected_outs = expert_outputs[topk_indices, batch_idx, :]
+            return torch.sum(selected_outs * routing_weights.unsqueeze(-1), dim=1)
+
+        if task_id is not None:
+            routers_to_use = [self.routers[task_id]]
+        else:
+            routers_to_use = self.routers
+
+        outputs = [route(router) for router in routers_to_use]
+        final_output = torch.stack(outputs).mean(dim=0)
+
+        return final_output
+
+
+class GraphMixer_initial(torch.nn.Module):
+    def __init__(self, input_dim=2227, num_layers=4, edge_agg='spatial', multires=False, resample=0,
+                 fusion=None, num_features=6, num_features2=1, hidden_dim=16, linear_dim=64, use_edges=False, pool=False, dropout=0.25, omic_sizes=[], n_classes=2):
+        super(GraphMixer_initial, self).__init__()
+        self.use_edges = use_edges
+        self.edge_agg = edge_agg
+        self.multires = multires
+        self.num_layers = num_layers - 1
+        self.resample = resample
+        self.sample_counter = 0
+        self.hidden_dim = hidden_dim
+
+        self.embedding3_dict = nn.ModuleDict({
+            '85': nn.Sequential(nn.Linear(85, 16), nn.ReLU(), nn.Dropout(0.25)),
+            '77': nn.Sequential(nn.Linear(77, 16), nn.ReLU(), nn.Dropout(0.25)),
+            '86': nn.Sequential(nn.Linear(86, 16), nn.ReLU(), nn.Dropout(0.25)),
+        })
+
+        self.coattn2 = MultiHeadAttentionQ(in_features=hidden_dim, head_num=2)
+        self.classifier = nn.Linear(544, 16)
+        self.classifier1 = nn.Linear(16, 8)
+        self.linear_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(num_features, hidden_dim),
+                nn.LeakyReLU(),
+                nn.Dropout(0.25)
+            ) for _ in range(34)
+        ])
+        self.linear_layers2 = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(6, hidden_dim),
+                nn.LeakyReLU(),
+                nn.Dropout(0.25)
+            ) for _ in range(24)
+        ])
+
+    def forward(self, x_path, x_omic, ref):
+        data = x_path
+        batch_size = data.size(0)
+
+        key = str(ref.shape[-1])
+        if key not in self.embedding3_dict:
+            raise ValueError(f"No embedding defined for input dim {ref.shape[-1]}")
+        ref = self.embedding3_dict[key](ref)
+        ref = ref.unsqueeze(1)
+
+        # 脑区组 34 个线性层（动态 batch_size 与设备绑定）
+        output_data = torch.zeros(batch_size, 34, 16, device=data.device, dtype=data.dtype)
+        for i in range(34):
+            output_data[:, i, :] = self.linear_layers[i](data[:, i, :])
+
+        # 基因组 24 个线性层（动态 batch_size 与设备绑定）
+        output_gene = torch.zeros(batch_size, 24, 16, device=x_omic.device, dtype=x_omic.dtype)
+        for i in range(24):
+            output_gene[:, i, :] = self.linear_layers2[i](x_omic[:, i, :])
+
+        # 注意力融合机制
+        data, G_coattn = self.coattn2(output_data, output_gene, output_gene)
+        data, G_coattn = self.coattn2(data, ref, ref)
+        data = data.view(data.size(0), -1)
+
+        logits = self.classifier(data)
+        logits = self.classifier1(logits)
+
+        # ✅ 修复：直接返回线性特征 Logits，不要用 sigmoid 扼杀特征多样性
+        return logits
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class PNNColumn(nn.Module):
+    def __init__(
+        self,
+        task_id,
+        mlp_input_dim=8,
+        mlp_hidden_dim=16,
+        mlp_output_dim=4,
+        moe_input_dim=8,
+        moe_hidden_dim=16,
+        moe_output_dim=4,
+        classifier_input_dim=4,
+        num_experts=4,
+        fusion_module=None
+    ):
+        super(PNNColumn, self).__init__()
+        self.task_id = task_id
+        self.mlp_input_dim = mlp_input_dim
+        self.mlp_hidden_dim = mlp_hidden_dim
+        self.mlp_output_dim = mlp_output_dim
+        self.moe_input_dim = moe_input_dim
+        self.moe_hidden_dim = moe_hidden_dim
+        self.moe_output_dim = moe_output_dim
+        self.classifier_input_dim = classifier_input_dim
+
+        # 1. 当前列的多模态融合模块与主干网络
+        self.fusion_module = (
+            GraphMixer_initial(num_features=6, hidden_dim=16)
+            if fusion_module is None else fusion_module
+        )
+        self.mlp = MLP(input_dim=mlp_input_dim, hidden_dim=mlp_hidden_dim, output_dim=mlp_output_dim)
+        self.moe = SparseMoEModel(input_dim=moe_input_dim, hidden_dim=moe_hidden_dim, output_dim=moe_output_dim, num_experts=num_experts)
+        self.classifier = nn.Linear(classifier_input_dim, 2)
+
+        if task_id > 0:
+            # 当前列融合输出维度为 8，拼接前置各列的 h1（维度为 mlp_output_dim = 4）
+            lateral_h1_dim = task_id * mlp_output_dim
+            # 当前列 h1_adapted 维度为 mlp_input_dim = 8，拼接前置各列的 h2（维度为 moe_output_dim = 4）
+            lateral_h2_dim = task_id * moe_output_dim
+            # 当前列 mlp_moe 维度为 4，拼接前置各列的 h3（维度为 classifier_input_dim = 4）
+            lateral_h3_dim = task_id * classifier_input_dim
+
+            self.adapter_h1 = nn.Linear(8 + lateral_h1_dim, mlp_input_dim)
+            self.adapter_h2 = nn.Linear(mlp_input_dim + lateral_h2_dim, moe_input_dim)
+            self.adapter_h3 = nn.Linear(classifier_input_dim + lateral_h3_dim, classifier_input_dim)
+        else:
+            self.adapter_h1 = nn.Identity()
+            self.adapter_h2 = nn.Identity()
+            self.adapter_h3 = nn.Identity()
+
+    def forward(self, modalities, lateral_inputs=None, task_id=None):
+        # 步骤 1：多模态特征融合
+        x = self.fusion_module(modalities['x_path'], modalities['x_omic'], modalities['ref'])
+
+        # 步骤 2：融合横向信号并进入 MLP (构建 h1)
+        if self.task_id > 0 and lateral_inputs is not None and 'h1' in lateral_inputs:
+            h1_in = torch.cat([x, lateral_inputs['h1']], dim=-1)
+            h1_adapted = self.adapter_h1(h1_in)
+        else:
+            h1_adapted = x
+
+        h1 = F.relu(self.mlp(h1_adapted))
+
+        # 步骤 3：融合横向信号并进入 MoE (构建 h2)
+        if self.task_id > 0 and lateral_inputs is not None and 'h2' in lateral_inputs:
+            h2_in = torch.cat([h1_adapted, lateral_inputs['h2']], dim=-1)
+            h2_adapted = self.adapter_h2(h2_in)
+        else:
+            h2_adapted = h1_adapted
+
+        h2 = self.moe(h2_adapted, task_id=task_id)
+        alpha = 0.5
+        mlp_moe = alpha * h1 + (1.0 - alpha) * h2
+
+        # 步骤 4：构建 h3 并计算未激活的 Logits
+        if self.task_id > 0 and lateral_inputs is not None and 'h3' in lateral_inputs:
+            h3_in = torch.cat([mlp_moe, lateral_inputs['h3']], dim=-1)
+            h3_adapted = self.adapter_h3(h3_in)
+        else:
+            h3_adapted = mlp_moe
+
+        h3 = h3_adapted
+        logits = self.classifier(h3)
+
+        features = {'h1': h1, 'h2': h2, 'h3': h3}
+        return logits, features
+
+
+class PNN(nn.Module):
+    def __init__(self, n_layers=3):
+        super(PNN, self).__init__()
+        self.n_layers = n_layers
+        self.columns = nn.ModuleList([])
+
+    def new_task(
+        self,
+        mlp_input_dim=8,
+        mlp_hidden_dim=16,
+        mlp_output_dim=4,
+        moe_input_dim=8,
+        moe_hidden_dim=16,
+        moe_output_dim=4,
+        classifier_input_dim=4,
+        num_experts=4
+    ):
+        task_id = len(self.columns)
+
+        # 1. 彻底冻结前序所有列的全部参数，从根本上防止灾难性遗忘
+        for prev_col in self.columns:
+            for param in prev_col.parameters():
+                param.requires_grad = False
+            prev_col.eval()
+
+        # 2. 静态初始化新列
+        new_col = PNNColumn(
+            task_id=task_id,
+            mlp_input_dim=mlp_input_dim,
+            mlp_hidden_dim=mlp_hidden_dim,
+            mlp_output_dim=mlp_output_dim,
+            moe_input_dim=moe_input_dim,
+            moe_hidden_dim=moe_hidden_dim,
+            moe_output_dim=moe_output_dim,
+            classifier_input_dim=classifier_input_dim,
+            num_experts=num_experts
+        )
+        self.columns.append(new_col)
+
+    def forward(self, modalities, task_id=-1):
+        if task_id == -1:
+            task_id = len(self.columns) - 1
+        if task_id >= len(self.columns):
+            raise IndexError(f"task_id {task_id} 超出当前列数范围")
+
+        # 提取前置列特征（使用 torch.no_grad 保证不会计算梯度）
+        prev_features_list = []
+        for i in range(task_id):
+            with torch.no_grad():
+                _, feats = self.columns[i](modalities, task_id=i)
+            prev_features_list.append(feats)
+
+        # 组织横向输入张量
+        lateral_input = {}
+        for feat_key in ['h1', 'h2', 'h3']:
+            collected = [f[feat_key] for f in prev_features_list]
+            if collected:
+                lateral_input[feat_key] = torch.cat(collected, dim=-1)
+
+        out, _ = self.columns[task_id](modalities, lateral_inputs=lateral_input if lateral_input else None, task_id=task_id)
+        return out
