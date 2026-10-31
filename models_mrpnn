@@ -144,17 +144,16 @@ class GraphMixer_initial(torch.nn.Module):
         ref = self.embedding3_dict[key](ref)
         ref = ref.unsqueeze(1)
 
-        # 脑区组 34 个线性层（动态 batch_size 与设备绑定）
+
         output_data = torch.zeros(batch_size, 34, 16, device=data.device, dtype=data.dtype)
         for i in range(34):
             output_data[:, i, :] = self.linear_layers[i](data[:, i, :])
 
-        # 基因组 24 个线性层（动态 batch_size 与设备绑定）
+
         output_gene = torch.zeros(batch_size, 24, 16, device=x_omic.device, dtype=x_omic.dtype)
         for i in range(24):
             output_gene[:, i, :] = self.linear_layers2[i](x_omic[:, i, :])
 
-        # 注意力融合机制
         data, G_coattn = self.coattn2(output_data, output_gene, output_gene)
         data, G_coattn = self.coattn2(data, ref, ref)
         data = data.view(data.size(0), -1)
@@ -162,7 +161,6 @@ class GraphMixer_initial(torch.nn.Module):
         logits = self.classifier(data)
         logits = self.classifier1(logits)
 
-        # ✅ 修复：直接返回线性特征 Logits，不要用 sigmoid 扼杀特征多样性
         return logits
 
 
@@ -194,7 +192,7 @@ class PNNColumn(nn.Module):
         self.moe_output_dim = moe_output_dim
         self.classifier_input_dim = classifier_input_dim
 
-        # 1. 当前列的多模态融合模块与主干网络
+
         self.fusion_module = (
             GraphMixer_initial(num_features=6, hidden_dim=16)
             if fusion_module is None else fusion_module
@@ -204,11 +202,11 @@ class PNNColumn(nn.Module):
         self.classifier = nn.Linear(classifier_input_dim, 2)
 
         if task_id > 0:
-            # 当前列融合输出维度为 8，拼接前置各列的 h1（维度为 mlp_output_dim = 4）
+
             lateral_h1_dim = task_id * mlp_output_dim
-            # 当前列 h1_adapted 维度为 mlp_input_dim = 8，拼接前置各列的 h2（维度为 moe_output_dim = 4）
+
             lateral_h2_dim = task_id * moe_output_dim
-            # 当前列 mlp_moe 维度为 4，拼接前置各列的 h3（维度为 classifier_input_dim = 4）
+
             lateral_h3_dim = task_id * classifier_input_dim
 
             self.adapter_h1 = nn.Linear(8 + lateral_h1_dim, mlp_input_dim)
@@ -220,10 +218,10 @@ class PNNColumn(nn.Module):
             self.adapter_h3 = nn.Identity()
 
     def forward(self, modalities, lateral_inputs=None, task_id=None):
-        # 步骤 1：多模态特征融合
+
         x = self.fusion_module(modalities['x_path'], modalities['x_omic'], modalities['ref'])
 
-        # 步骤 2：融合横向信号并进入 MLP (构建 h1)
+
         if self.task_id > 0 and lateral_inputs is not None and 'h1' in lateral_inputs:
             h1_in = torch.cat([x, lateral_inputs['h1']], dim=-1)
             h1_adapted = self.adapter_h1(h1_in)
@@ -232,7 +230,7 @@ class PNNColumn(nn.Module):
 
         h1 = F.relu(self.mlp(h1_adapted))
 
-        # 步骤 3：融合横向信号并进入 MoE (构建 h2)
+
         if self.task_id > 0 and lateral_inputs is not None and 'h2' in lateral_inputs:
             h2_in = torch.cat([h1_adapted, lateral_inputs['h2']], dim=-1)
             h2_adapted = self.adapter_h2(h2_in)
@@ -243,7 +241,7 @@ class PNNColumn(nn.Module):
         alpha = 0.5
         mlp_moe = alpha * h1 + (1.0 - alpha) * h2
 
-        # 步骤 4：构建 h3 并计算未激活的 Logits
+
         if self.task_id > 0 and lateral_inputs is not None and 'h3' in lateral_inputs:
             h3_in = torch.cat([mlp_moe, lateral_inputs['h3']], dim=-1)
             h3_adapted = self.adapter_h3(h3_in)
@@ -276,13 +274,13 @@ class PNN(nn.Module):
     ):
         task_id = len(self.columns)
 
-        # 1. 彻底冻结前序所有列的全部参数，从根本上防止灾难性遗忘
+
         for prev_col in self.columns:
             for param in prev_col.parameters():
                 param.requires_grad = False
             prev_col.eval()
 
-        # 2. 静态初始化新列
+
         new_col = PNNColumn(
             task_id=task_id,
             mlp_input_dim=mlp_input_dim,
@@ -302,14 +300,13 @@ class PNN(nn.Module):
         if task_id >= len(self.columns):
             raise IndexError(f"task_id {task_id} 超出当前列数范围")
 
-        # 提取前置列特征（使用 torch.no_grad 保证不会计算梯度）
+
         prev_features_list = []
         for i in range(task_id):
             with torch.no_grad():
                 _, feats = self.columns[i](modalities, task_id=i)
             prev_features_list.append(feats)
 
-        # 组织横向输入张量
         lateral_input = {}
         for feat_key in ['h1', 'h2', 'h3']:
             collected = [f[feat_key] for f in prev_features_list]
