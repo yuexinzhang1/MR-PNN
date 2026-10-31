@@ -120,7 +120,6 @@ class CustomDataset(Dataset):
             for j in range(34):
                 for k in range(6):
                     feature_idx = k * 34 + j
-                    # 修复 FutureWarning: 使用 iloc 替代原生角标
                     reshaped_data_brain[i, j, k] = sample_features.iloc[feature_idx]
 
         self.features = reshaped_data_brain
@@ -139,7 +138,7 @@ class CustomDataset(Dataset):
         additional_features_reshaped = np.repeat(additional_features[:, np.newaxis, :], 24, axis=1)
         reshaped_data_gene = np.concatenate((reshaped_data_gene, additional_features_reshaped), axis=2)
 
-        data_ukb = pd.read_csv(r"G:\MyData\ProgressiveNeuralNetworks.pytorch-master\24脑区+age+sex.csv")
+        data_ukb = pd.read_csv(r"G:\MyData\ProgressiveNeuralNetworks.pytorch-master\brain+age+sex.csv")
         new_genomic_data = np.zeros((self.data.shape[0], 24, 6))
         new_genomic_data[:, :, :4] = reshaped_data_gene
         for i in range(self.data.shape[0]):
@@ -173,8 +172,6 @@ class CustomDataset(Dataset):
 
 def evaluate_model_with_metrics(model, test_loader, task_id):
     """
-    通用、鲁棒的多指标测试函数
-    彻底移除 batch_size < 64 的跳过逻辑，确保所有测试集样本全量参与评测
     """
     model.eval()
     all_true = []
@@ -183,7 +180,6 @@ def evaluate_model_with_metrics(model, test_loader, task_id):
 
     with torch.no_grad():
         for features, genomic, labels, brain, ref in test_loader:
-            # ✅ 移除跳过限制！测试集任何尺寸的 batch 都要计算
 
             modalities = {
                 'x_path': features,
@@ -195,16 +191,15 @@ def evaluate_model_with_metrics(model, test_loader, task_id):
 
             logits = model(modalities, task_id=task_id)
 
-            # 兼容模型直接返回 Logits 或 Sigmoid 概率
-            if logits.size(1) == 2:  # [B, 2] 二分类 Logits
+            if logits.size(1) == 2:  
                 probs = torch.softmax(logits, dim=1)
                 preds = torch.argmax(probs, dim=1)
                 prob_positive = probs[:, 1].cpu().numpy()
-            else:  # [B, 1] 单通道输出
+            else:  
                 prob_positive = torch.sigmoid(logits).squeeze().cpu().numpy()
                 preds = (torch.sigmoid(logits).squeeze() > 0.5).int()
 
-            # 兼容 One-Hot 标签与单值标签
+
             if labels.dim() > 1 and labels.size(1) > 1:
                 true_labels_single = labels.argmax(dim=1).cpu().numpy()
             else:
@@ -223,7 +218,6 @@ def evaluate_model_with_metrics(model, test_loader, task_id):
     # 1. ACC
     acc = accuracy_score(all_true, all_pred)
 
-    # 2. 混淆矩阵 (固定类别 labels=[0, 1]，防止极端情况下类别缺失无法解包)
     try:
         tn, fp, fn, tp = confusion_matrix(all_true, all_pred, labels=[0, 1]).ravel()
         sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -231,7 +225,7 @@ def evaluate_model_with_metrics(model, test_loader, task_id):
         precision = precision_score(all_true, all_pred, zero_division=0)
         f1_score_val = f1_score(all_true, all_pred, zero_division=0)
     except Exception as e:
-        print(f"⚠️  Confusion matrix 计算异常: {e}")
+        print(f"⚠️  Confusion matrix : {e}")
         sensitivity = specificity = precision = f1_score_val = float('nan')
 
     # 3. AUC
@@ -239,7 +233,7 @@ def evaluate_model_with_metrics(model, test_loader, task_id):
         fpr, tpr, _ = roc_curve(all_true, all_probs)
         auc_score = auc(fpr, tpr)
     except Exception as e:
-        print(f"⚠️  ROC/AUC 计算异常: {e}")
+        print(f"⚠️  ROC/AUC : {e}")
         auc_score = 0.5
 
     return acc, sensitivity, specificity, auc_score, precision, f1_score_val
